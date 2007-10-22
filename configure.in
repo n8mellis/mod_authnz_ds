@@ -1,0 +1,41 @@
+# Use autoconf to construct a configure file
+AC_INIT(mod_authnz_ds, 1.0, nmellis@maf.org)
+AC_CONFIG_SRCDIR([src/mod_authnz_ds.c])
+
+# Check for pre-reqs
+AC_PROG_CC
+AC_PROG_MAKE_SET
+
+# Check for libraries
+LIB_resolv=""
+AC_CHECK_LIB([resolv], [main], [LIB_resolv=-lresolv])
+AC_SUBST(LIB_resolv)
+
+# Check for header files
+AC_HEADER_STDC
+AC_CHECK_HEADERS([string.h stdlib.h unistd.h])
+
+# Check for typedefs, structs, etc.
+AC_TYPE_SIZE_T
+AC_STRUCT_TM
+
+
+# Check for Apache
+AC_ARG_WITH(apache, 
+  AC_HELP_STRING([--with-apache=dir],[use Apache in dir]), 
+  [ with_apache="$withval" ])
+  
+
+AC_PATH_PROG([APXS], [apxs], [], [$with_apache/bin:$with_apache/sbin:$PATH])
+if test -z "$APXS"; then
+  AC_PATH_PROG([APXS], [apxs2], [], [$with_apache/bin:$with_apache/sbin:$PATH])
+  if test -z "$APXS"; then
+    AC_MSG_ERROR([Failed to find Apache apxs executable])
+  fi
+fi
+
+AC_SUBST(APXS)
+
+AC_CONFIG_FILES([Makefile])
+
+AC_OUTPUT
