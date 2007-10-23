@@ -190,6 +190,7 @@ tDirStatus LocateUserNode(tDirReference inDSRef, tDirNodeReference inSearchNode,
                 
                 // Get the value from the attribute if we were successful at getting an entry
                 if (dsStatus == eDSNoErr) {
+                    
                     dsStatus = dsGetAttributeValue(inSearchNode, pSearchBuffer, 1, 
                                                    dsAttributeValueListRef, 
                                                    &dsAttributeValueEntryPtr);
@@ -388,6 +389,185 @@ cleanup:
 	return dsStatus;
 }
 
+// -------------------------------------------------------------------------------------------------
+int CheckGroupMembership(tDirReference inDSRef, tDirNodeReference inSearchNode, 
+                         const char *inGroupName, const char *inUsername)
+{
+    int             result          = 0;
+    tDirStatus      dsStatus        = eDSRecordNotFound;
+    tDataListPtr    pAttribsToGet   = NULL;
+    tDataListPtr    pRecTypeList    = NULL;
+    tDataListPtr    pRecNameList    = NULL;
+    tDataBufferPtr  pSearchBuffer   = NULL;
+    unsigned long   ulRecCount      = 0;    // Do not limit the number of records we are expecting
+    unsigned long   ulBufferSize    = 2048; // Start with a 2k buffer
+    
+    // Ensure that none of the parameters are NULL
+    if (inDSRef == 0 || inSearchNode == 0 || inGroupName == NULL || inUsername == NULL)
+    {
+        return eDSNullParameter;
+    }
+    
+    // We will want the actual record name and the name of thenode where the user resides
+    pAttribsToGet = dsBuildListFromStrings(
+                                inDSRef, kDSNAttrRecordName, kDSNAttrGroupMembership, NULL);
+    if (pAttribsToGet == NULL) {
+        dsStatus = eMemoryAllocError;
+        goto cleanup;
+    }
+    
+    // Build a list to search for user record
+    pRecNameList = dsBuildListFromStrings(inDSRef, inGroupName, NULL);
+    if (pRecNameList == NULL) {
+        dsStatus = eMemoryAllocError;
+        goto cleanup;
+    }
+    
+    // Build a list of record types to search; in this case, users
+    pRecTypeList = dsBuildListFromStrings(inDSRef, kDSStdRecordTypeGroups, NULL);
+    if (pRecTypeList == NULL) {
+        dsStatus = eMemoryAllocError;
+        goto cleanup;
+    }
+    
+    // Allocate a working buffer; this may be grown if we receive a eDSBufferTooSmall error
+    pSearchBuffer = dsDataBufferAllocate(inDSRef, ulBufferSize);
+    if (pSearchBuffer == NULL) {
+        dsStatus = eMemoryAllocError;
+        goto cleanup;
+    }
+    
+    // Now search for the record
+    dsStatus = dsGetRecordList(inSearchNode, pSearchBuffer, pRecNameList, eDSExact, pRecTypeList, 
+                               pAttribsToGet, 0, &ulRecCount, NULL);
+    
+    // If there was not an error and we only found 1 record for this user
+    if (dsStatus == eDSNoErr && ulRecCount == 1) {
+        tAttributeListRef   dsAttributeListRef  = 0;
+        tRecordEntryPtr     dsRecordEntryPtr    = 0;
+        int ii;
+        int jj;
+        
+        // Get the first record entry from the buffer since we only expect one result
+        dsStatus = dsGetRecordEntry(inSearchNode, pSearchBuffer, 1, &dsAttributeListRef, 
+                                    &dsRecordEntryPtr);
+        if (dsStatus == eDSNoErr) {
+            // Loop through the attributes in the record to get the data we requested
+            // NOTE: all indexes in the Open Directory API start with 1, not 0
+            for (ii = 1; ii <= dsRecordEntryPtr->fRecordAttributeCount; ii++) {
+                tAttributeEntryPtr      dsAttributeEntryPtr         = NULL;
+                tAttributeValueEntryPtr dsAttributeValueEntryPtr    = NULL;
+                tAttributeValueListRef  dsAttributeValueListRef     = 0;
+                
+                // Get the attribute entry from the record
+                dsStatus = dsGetAttributeEntry(inSearchNode, pSearchBuffer, dsAttributeListRef, 
+                                               ii, &dsAttributeValueListRef, &dsAttributeEntryPtr);
+                
+                // Get the value from the attribute if we were successful at getting an entry
+                if (dsStatus == eDSNoErr) {
+                    
+                    for (jj = 1; jj <= dsAttributeEntryPtr->fAttributeValueCount; jj++) {
+                        dsStatus = dsGetAttributeValue(inSearchNode, pSearchBuffer, jj, 
+                                                       dsAttributeValueListRef, 
+                                                       &dsAttributeValueEntryPtr);
+                        
+                        // If we were successful, see which attribute we were getting and fill in 
+                        // the return values appropriately
+                        if (dsStatus == eDSNoErr) {
+                            // Always check for the specific attributes, since a plugin is not 
+                            // restricted from returning more data than you requested
+                            
+                            // Check the signature of the attribute and see if it is the group field
+                            if (strcmp(dsAttributeEntryPtr->fAttributeSignature.fBufferData, 
+                                       kDSNAttrGroupMembership) == 0)
+                            {
+                                if (strcmp(inUsername, 
+                                    dsAttributeValueEntryPtr->fAttributeValueData.fBufferData) == 0)
+                                {
+                                    result = 1;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                // Close any value list references that may have been opened
+                if (dsAttributeValueListRef != 0) {
+                    dsCloseAttributeList(dsAttributeValueListRef);
+                    dsAttributeValueListRef = 0;
+                }
+                
+                // Free the attribute value entry if we got an entry
+                if (dsAttributeValueEntryPtr != NULL) {
+                    dsDeallocAttributeValueEntry(inDSRef, dsAttributeValueEntryPtr);
+                    dsAttributeValueEntryPtr = NULL;
+                }
+                
+                // Free the attribute entry itself as well
+                if (dsAttributeEntryPtr != NULL) {
+                    dsDeallocAttributeEntry(inDSRef, dsAttributeEntryPtr);
+                    dsAttributeEntryPtr = NULL;
+                }
+                
+                // If we've already found a result, then there is no need to continue
+                if (result == 1)
+                    break;
+            }
+            
+            // Close any reference to the attribute list
+            if (dsAttributeListRef != 0) {
+                dsCloseAttributeList(dsAttributeListRef);
+                dsAttributeListRef = 0;
+            }
+            
+            //Deallocate the record entry
+            if (dsRecordEntryPtr != NULL) {
+                dsDeallocRecordEntry(inDSRef, dsRecordEntryPtr);
+                dsRecordEntryPtr = NULL;
+            }
+        }
+    }
+    else if (dsStatus == eDSNoErr && ulRecCount > 1) {
+        // We have more than 1 user, then we shouldn't attempt to authenticate.
+        // Return a eDSAuthInvalidUserName since we don't know which user to authenticate
+        dsStatus = eDSAuthInvalidUserName;
+    }
+    
+cleanup:
+        // If we allocated pAttribsToGet, clean it up
+        if (pAttribsToGet != NULL) {
+            dsDataListDeallocate(inDSRef, pAttribsToGet);
+            // Need to free the pointer since dsDataListDeallocate only frees the list items
+            free(pAttribsToGet);
+            pAttribsToGet = NULL;
+        }
+    
+    // If we allocated pRecTypeList, clean it up
+    if (pRecTypeList != NULL) {
+        dsDataListDeallocate(inDSRef, pRecTypeList);
+        // Need to free the pointer since dsDataListDeallocate only frees the list items
+        free(pRecTypeList);
+        pRecTypeList = NULL;
+    }
+    
+    // If we allocated pRecNameList, clean it up
+    if (pRecNameList != NULL) {
+        dsDataListDeallocate(inDSRef, pRecNameList);
+        // Need to free the pointer since dsDataListDeallocate only frees the list items
+        free(pRecNameList);
+        pRecNameList = NULL;
+    }
+    
+    // If we allocated pSearchBuffer, clean it up
+    if (pSearchBuffer != NULL) {
+        dsDataBufferDeAllocate(inDSRef, pSearchBuffer);
+        pSearchBuffer = NULL;
+    }
+    
+    return result;
+} // CheckGroupMembership
+
 
 // -------------------------------------------------------------------------------------------------
 // authn_ds_config_t definition
@@ -399,6 +579,14 @@ typedef struct {
 #endif
     int auth_authoritative;         // Is this module authoritative (i.e. pass on after failure)
 } authn_ds_config_t;
+
+// -------------------------------------------------------------------------------------------------
+// authn_ds_request_t definition
+// -------------------------------------------------------------------------------------------------
+typedef struct {
+    char *user;
+} authn_ds_request_t;
+
 
 
 // -------------------------------------------------------------------------------------------------
@@ -420,7 +608,7 @@ static void *create_authnz_ds_dir_config(apr_pool_t *p, char *d)
 }
 
 // -------------------------------------------------------------------------------------------------
-// Authenication Phase
+// Authentication Phase
 // -------------------------------------------------------------------------------------------------
 static authn_status authn_ds_check_password(request_rec *r, const char *user, const char *password)
 {
@@ -437,7 +625,11 @@ static authn_status authn_ds_check_password(request_rec *r, const char *user, co
     }
     
     // We have the required information, so proceed
-    authn_status        auth_status     = AUTH_GRANTED;
+    authn_status        auth_status     = AUTH_DENIED;
+    authn_ds_request_t  *req = 
+        (authn_ds_request_t *)apr_pcalloc(r->pool, sizeof(authn_ds_request_t));
+    ap_set_module_config(r->request_config, &authnz_ds_module, req);
+    
     tDirReference       dsRef           = 0;
     tDirNodeReference   dsSearchNodeRef = 0;
     tDirNodeReference   dsUserNodeRef   = 0;
@@ -474,6 +666,7 @@ static authn_status authn_ds_check_password(request_rec *r, const char *user, co
                                                   kDSStdAuthNodeNativeClearTextOK, 
                                                   pRecordName, password);
                         if (dsStatus == eDSNoErr) {
+                            req->user = apr_pstrdup(r->pool, pRecordName);
                             auth_status = AUTH_GRANTED;
                         }
                         else {
@@ -529,7 +722,88 @@ static authn_status authn_ds_check_password(request_rec *r, const char *user, co
 // -------------------------------------------------------------------------------------------------
 static int authz_ds_check_user_access(request_rec *r)
 {
-    return OK;
+    int result = DECLINED;
+    authn_ds_request_t *req = 
+        (authn_ds_request_t *)ap_get_module_config(r->request_config, &authnz_ds_module);
+    authn_ds_config_t *sec = 
+        (authn_ds_config_t *)ap_get_module_config(r->per_dir_config, &authnz_ds_module);
+    
+    const apr_array_header_t *reqs_arr = ap_requires(r);
+    require_line *reqs = reqs_arr ? (require_line *)reqs_arr->elts : NULL;
+    
+    const char *req_line;
+    char *authType;
+    char *authEntity;
+    char *user = req->user;
+    if (user == NULL) {
+        user = r->user;
+    }
+    
+    int                 isAuthorized    = 0;
+    tDirReference       dsRef           = 0;
+    tDirNodeReference   dsSearchNodeRef = 0;
+    tDirNodeReference   dsUserNodeRef   = 0;
+    tDirStatus          dsStatus;
+    char               *pRecordName     = NULL;
+    char               *pNodeName       = NULL;
+    
+    // Open a connection to Directory Services
+    dsStatus = dsOpenDirService(&dsRef);
+    if (dsStatus == eDSNoErr) {
+        // Open the search node
+        dsStatus = OpenSearchNode(dsRef, &dsSearchNodeRef);
+        if (dsStatus == eDSNoErr) {
+            // Check to see if the user is in the required group
+            int i;
+            for (i = 0; i < reqs_arr->nelts; i++) {
+                req_line = reqs[i].requirement;
+                authType = ap_getword_white(r->pool, &req_line);
+                if (strcmp(authType, "group") == 0) {
+                    while (req_line[0]) {
+                        authEntity = ap_getword_conf(r->pool, &req_line);
+                        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, 
+                                      "Attempting to authorize %s in group %s", 
+                                      user, authEntity);
+                        
+                        isAuthorized = CheckGroupMembership(
+                                            dsRef, dsSearchNodeRef, authEntity, user);
+                        if (isAuthorized) {
+                            ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "%s is authorized", user);
+                            result = OK;
+                            goto done;
+                        }
+                    }
+                }
+                else if (strcmp(authType, "user") == 0) {
+                    while (req_line[0]) {
+                        authEntity = ap_getword_conf(r->pool, &req_line);
+                        isAuthorized = strcmp(authEntity, user) == 0;
+                        if (isAuthorized) {
+                            ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "%s is authorized", user);
+                            result = OK;
+                            goto done;
+                        }
+                    }
+                }
+            }
+            
+done:            
+            // Close the search node
+            dsCloseDirNode(dsSearchNodeRef);
+            dsSearchNodeRef = 0;
+        }
+        else {
+            ap_log_rerror(APLOG_MARK, APLOG_WARNING, 0, r, 
+                          "Unable to locate and open the Search Node");
+            isAuthorized = 0;
+        }
+        
+        // Close the connection to Directory Services
+        dsCloseDirService(dsRef);
+        dsRef = 0;
+    }
+    
+    return result;
 }
 
 // -------------------------------------------------------------------------------------------------
