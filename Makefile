@@ -2,7 +2,7 @@ APXS = /opt/local/apache2/bin/apxs
 LIB_resolv = -lresolv
 
 CPPFLAGS = -I.
-LDFLAGS = $(LIB_resolv) -framework DirectoryService
+LDFLAGS = $(LIB_resolv) -framework Security
 CFLAGS = 
 
 # APXS_CPPFLAGS = ${shell [ -n "${CPPFLAGS}" ] && echo ${CPPFLAGS} | sed -e 's/\([^ ]*\)/-Wc,\1/g'}
