@@ -29,6 +29,8 @@
 #include <Security/Security.h>
 #include <membership.h>
 
+#include <Kerberos/Kerberos.h>
+
 // These methods aren't exported in the headers
 int checkpw(const char* username, const char* password);
 int mbr_reset_cache(void);
@@ -36,6 +38,7 @@ int mbr_user_name_to_uuid(const char* name, uuid_t uu);
 int mbr_group_name_to_uuid(const char* name, uuid_t uu);
 
 #define MECH_NEGOTIATE "Negotiate"
+#define SERVICE_NAME "HTTP"
 
 
 #pragma mark -
@@ -48,13 +51,16 @@ module AP_MODULE_DECLARE_DATA authnz_ds_module;
 // authn_ds_config_t definition
 // -------------------------------------------------------------------------------------------------
 typedef struct {
-    apr_pool_t *pool;               // Pool that this config is allocated from
+    apr_pool_t *pool;                   // Pool that this config is allocated from
 #if APR_HAS_THREADS
-    apr_thread_mutex_t *lock;       // Lock for this config
+    apr_thread_mutex_t *lock;           // Lock for this config
 #endif
-    int auth_authoritative;         // Is this module authoritative (i.e. pass on after failure)
-    int enable_kerberos;            // Enables Kerberos authentication
-    int enable_basic;               // Enables Basic (password-based) authentication
+    int auth_authoritative;             // Is this module authoritative (i.e. pass on after failure)
+    int enable_kerberos;                // Enables Kerberos authentication
+    int enable_basic;                   // Enables Basic (password-based) authentication
+    char *kerberos_keytab;              // Location of the Kerberos keytab file
+    char *kerberos_realms;              // The Kerberos realms to look in
+    const char *kerberos_service_name;  // The service name for Kerberos, usually HTTP
 } authn_ds_config_t;
 
 // -------------------------------------------------------------------------------------------------
@@ -80,59 +86,386 @@ typedef struct {
 
 
 #pragma mark -
-#pragma mark Authentication Phase
 // -------------------------------------------------------------------------------------------------
 // Authentication Phase
 // -------------------------------------------------------------------------------------------------
 // Inspired by mod_auth_kerb
-static void set_auth_headers(request_rec *r, authn_ds_config_t *conf, char *negotiate_response)
+static void set_auth_headers(request_rec *r, authn_ds_config_t *conf, int use_password, 
+                             char *negotiate_response)
 {
     const char *auth_name = NULL;
     char *negotiate_params;
     const char *header_name = 
-        (r->proxyreq == PROXYREQ_PROXY) ? "Proxy-Authenticate" : "WWW-Authenticate";
+    (r->proxyreq == PROXYREQ_PROXY) ? "Proxy-Authenticate" : "WWW-Authenticate";
     
     // Get the auth name
     auth_name = ap_auth_name(r);
     
     // Add the headers for Negotiate method if enabled
     if (conf->enable_kerberos && negotiate_response != NULL) {
-        negotiate_params = (*negotiate_response == '\0') ? MECH_NEGOTIATE :
-            apr_pstrcat(r->pool, MECH_NEGOTIATE " ", negotiate_response, NULL);
+        negotiate_params = (*negotiate_response == '\0') ? 
+            MECH_NEGOTIATE : apr_pstrcat(r->pool, MECH_NEGOTIATE " ", negotiate_response, NULL);
         apr_table_add(r->err_headers_out, header_name, negotiate_params);
     }
     
     // Add the headers for Basic if enabled
-    if (conf->enable_basic) {
+    if (conf->enable_basic && use_password) {
         apr_table_add(r->err_headers_out, header_name, 
                       apr_pstrcat(r->pool, "Basic realm=\"", auth_name, "\"", NULL));
     }
 }
 
+#pragma mark Kerberos Authentication
 // -------------------------------------------------------------------------------------------------
-// Inspired by mod_auth_kerb
-static int authn_already_succeeded(request_rec *r)
+// Taken from mod_auth_kerb
+static const char * get_gss_error(apr_pool_t *p, OM_uint32 majorError, OM_uint32 minorError, 
+                                 char *prefix)
 {
-//    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, 
-//                  "Is initial request: %s", ap_is_initial_req(r) ? "Yes" : "No");
-//    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, 
-//                  "Auth type: %s", r->ap_auth_type);
+    OM_uint32 majorStatus, minorStatus;
+    OM_uint32 messageContext = 0;
+    gss_buffer_desc statusString;
+    char *errorMessage;
+    
+    errorMessage = apr_pstrdup(p, prefix);
+    do {
+        majorStatus = gss_display_status(&minorStatus, majorError, GSS_C_GSS_CODE, GSS_C_NO_OID, 
+                                         &messageContext, &statusString);
+        if (GSS_ERROR(majorStatus))
+            break;
+        
+        errorMessage = apr_pstrcat(p, errorMessage, ": ", (char *)statusString.value, NULL);
+        gss_release_buffer(&minorStatus, &statusString);
+        
+        majorStatus = gss_display_status(&minorStatus, minorError, GSS_C_MECH_CODE, GSS_C_NULL_OID, 
+                                         &messageContext, &statusString);
+        if (!GSS_ERROR(majorStatus)) {
+            errorMessage = 
+                apr_pstrcat(p, errorMessage, " (", (char *)statusString.value, ")", NULL);
+            gss_release_buffer(&minorStatus, &statusString);
+        }
+    } while (!GSS_ERROR(majorStatus) && messageContext != 0);
+    
+    return errorMessage;
+}
 
-    if (ap_is_initial_req(r) || r->ap_auth_type == NULL)
-        return 0;
-    if (strcmp(r->ap_auth_type, MECH_NEGOTIATE) || strcmp(r->ap_auth_type, "Basic")) {
-        return 1;
+// -------------------------------------------------------------------------------------------------
+// Taken from Apple Sample Code Network Authenticate/GSSauthenticate.c
+static int AcquireGSSCredentials(request_rec *r, const char *inServiceName, 
+                                 gss_cred_id_t *outServiceCredentials)
+{
+    gss_name_t      stServerName    = GSS_C_NO_NAME;
+    gss_buffer_desc stNameBuffer;
+    OM_uint32       iMajorStatus;
+    OM_uint32       iMinorStatus;
+    
+    // Check the inServiceName to see if it has a string
+    if (inServiceName == NULL || *inServiceName == '\0') {
+        return -1;
     }
+    
+    // Fill the stNameBuffer with the incoming service name
+    stNameBuffer.value  = (char *)inServiceName;
+    stNameBuffer.length = strlen(inServiceName) + 1;
+    
+    iMajorStatus = 
+        gss_import_name(&iMinorStatus, &stNameBuffer, GSS_C_NT_HOSTBASED_SERVICE, &stServerName);
+    
+    if (iMajorStatus != GSS_S_COMPLETE) {
+        // Log here if necessary with more detail using:
+		//		gss_display_status( &tempStatus, iMajorStatus, GSS_C_GSS_CODE, ... )
+		//		gss_display_status( &tempStatus, iMinorStatus, GSS_C_MECH_CODE, ... )
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, 
+                      "Kerberos: Failure in AcquireGSSCredentials in gss_import_name");
+        return -1;
+    }
+    
+    // Get credentials with the expectation that we are accepting credentials on behalf of this 
+    // service.  This will go to the keytab to look for the key for this service and prepare to 
+    // allow authentication to the service by clients
+    iMajorStatus = gss_acquire_cred(&iMinorStatus, stServerName, GSS_C_INDEFINITE, 
+                                    GSS_C_NULL_OID_SET, GSS_C_ACCEPT, outServiceCredentials, 
+                                    NULL, NULL);
+    
+    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "Kerberos: gss_acquire_cred major status: %d", 
+                  iMajorStatus);
+    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "Kerberos: gss_acquire_cred minor status: %d", 
+                  iMinorStatus);
+    
+    if (iMajorStatus == GSS_S_NO_CRED)
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "Kerberos: NO_CRED");
+    else if (iMajorStatus == GSS_S_BAD_NAME)
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "Kerberos: BAD_NAME");
+    else if (iMajorStatus == GSS_S_BAD_MECH)
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "Kerberos: BAD_MECH");
+    else if (iMajorStatus == GSS_S_CREDENTIALS_EXPIRED)
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "Kerberos: CREDENTIALS_EXPIRED");
+    else if (iMajorStatus == GSS_S_BAD_NAMETYPE)
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "Kerberos: BAD_NAMETYPE");
+
+        
+    
+    // Need to release the allocated stServerName
+    OM_uint32 iTempStatus;  // Create a temporary variable so we don't overwrite iMinorStatus
+    gss_release_name(&iTempStatus, &stServerName);
+    
+    // Check our status and determine if we succeeded or not
+    if (iMajorStatus != GSS_S_COMPLETE) {
+        // Log here if necessary with more detail using:
+		//		gss_display_status( &tempStatus, iMajorStatus, GSS_C_GSS_CODE, ... )
+		//		gss_display_status( &tempStatus, iMinorStatus, GSS_C_MECH_CODE, ... )
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, 
+                      "Kerberos: Failure in AcquireGSSCredentials in gss_acquire_cred");
+		return -1;        
+    }
+    
     return 0;
+}
+
+// -------------------------------------------------------------------------------------------------
+// Taken from Apple Sample Code Network Authenticate/GSSauthenticate.c
+static OM_uint32 AuthenticateGSS(request_rec *r, char *inToken, int inTokenLength, 
+                                 char **outToken, int *outTokenLength, 
+                                 char **inOutServiceName, char **outUserPrincipal, 
+                                 gss_ctx_id_t *inOutGSSContext, gss_cred_id_t *inOutGSSCreds)
+{
+    OM_uint32       minorStatus         = 0;
+    OM_uint32       majorStatus         = GSS_S_DEFECTIVE_TOKEN;
+    gss_buffer_desc sendToken           = GSS_C_EMPTY_BUFFER;
+    gss_buffer_desc recvToken           = { inTokenLength, inToken };
+    gss_name_t      gssClientPrincipal  = GSS_C_NO_NAME;
+    
+    if (inToken == NULL) {
+        // our default majorStatus is GSS_S_DEFECTIVE_TOKEN
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, 
+                      "Kerberos: Failure in AuthenticateGSS; inToken is NULL");
+        goto finished;
+    }
+    
+    // If we don't have credentials and a service name is supplied, attempt to get credentials
+    // for that service principal
+    if (*inOutGSSCreds == NULL && inOutServiceName && *inOutServiceName && 
+        (*inOutServiceName)[0] != '\0')
+    {
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "Fetching GSS Credentials");
+        if (AcquireGSSCredentials(r, *inOutServiceName, inOutGSSCreds) != 0) {
+            majorStatus = GSS_S_DEFECTIVE_CREDENTIAL;
+            ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, 
+                    "Kerberos: Failure in AuthenticateGSS; AcquireGSSCredentials result is not 0");
+            goto finished;
+        }
+    }
+    
+    // Let's accept the security context.  If this is a new context, it will set a new one 
+    // based on the incoming token
+    majorStatus = gss_accept_sec_context(&minorStatus, inOutGSSContext, *inOutGSSCreds, &recvToken, 
+                                         GSS_C_NO_CHANNEL_BINDINGS, &gssClientPrincipal, NULL, 
+                                         &sendToken, NULL, NULL, NULL);
+    
+    if (majorStatus == GSS_S_COMPLETE) {
+        // If a service name was not specified for this, let's return the one that was used
+        if (inOutServiceName != NULL && *inOutServiceName == NULL) {
+            // Export the credentials that were used to make the connection
+            // (i.e. http/server@REALM, server@REALM, etc.)
+            gss_name_t servicePrincipal = GSS_C_NO_NAME;
+            
+            // Get the information from the buffer
+            majorStatus = gss_inquire_context(&minorStatus, *inOutGSSContext, NULL, 
+                                              &servicePrincipal, NULL, NULL, NULL, NULL, NULL);
+            if (majorStatus == GSS_S_COMPLETE) {
+                gss_buffer_desc nameToken = GSS_C_EMPTY_BUFFER;
+                
+                // Now let's get a readable version of the service principal
+                majorStatus = gss_display_name(&minorStatus, servicePrincipal, &nameToken, NULL);
+                if (majorStatus == GSS_S_COMPLETE) {
+                    *inOutServiceName = apr_pstrdup(r->pool, nameToken.value);
+                    gss_release_buffer(&minorStatus, &nameToken);
+                }
+            }
+        }
+        
+        // Reset to complete regardless because we don't want to return an error
+        majorStatus = GSS_S_COMPLETE;
+    }
+    
+    // If we have a return token, be sure to return it, whether it is a continue et al.
+    if (sendToken.length && sendToken.value) {
+        *outTokenLength = sendToken.length;
+        *outToken = apr_pcalloc(r->pool, sendToken.length);
+        
+        bcopy(sendToken.value, *outToken, sendToken.length);
+    }
+    else {
+        *outTokenLength = 0;
+        *outToken = NULL;
+    }
+    
+    // Release any buffer held by sendToken
+    gss_release_buffer(&minorStatus, &sendToken);
+    
+finished:
+    // If we weren't successful, let's cleanup the context
+    if (majorStatus != GSS_S_CONTINUE_NEEDED && majorStatus != GSS_S_COMPLETE) {
+        gss_delete_sec_context(&minorStatus, inOutGSSContext, GSS_C_NO_BUFFER);
+        *inOutGSSContext = GSS_C_NO_CONTEXT;
+    }
+    
+    // Let's return the gssClientPrincipal in case they want to note a failure, but only if it 
+    // is not already set
+    if (gssClientPrincipal != NULL && *outUserPrincipal == NULL) {
+        gss_buffer_desc nameToken = GSS_C_EMPTY_BUFFER;
+        
+        OM_uint32 iStatus = gss_display_name(&minorStatus, gssClientPrincipal, &nameToken, NULL);
+        if (iStatus == GSS_S_COMPLETE) {
+            *outUserPrincipal = apr_pstrdup(r->pool, nameToken.value);
+            gss_release_buffer(&minorStatus, &nameToken);
+        }
+    }
+    
+    return majorStatus;
 }
 
 // -------------------------------------------------------------------------------------------------
 static int authn_ds_kerberos(request_rec *r, authn_ds_config_t *conf, const char *auth_line, 
                              char **negotiate_response)
 {
-    return OK;
+    int             response            = HTTP_UNAUTHORIZED;
+    
+    char           *pRecvToken          = NULL;
+    int             iRecvTokenLength    = 0;
+    char           *pSendToken          = NULL;
+    int             iSendTokenLength    = 0;
+    char           *pUserPrincipal      = NULL;
+    char           *pServiceName        = NULL;
+    gss_ctx_id_t    gssContext          = GSS_C_NO_CONTEXT;
+    gss_cred_id_t   gssCreds            = GSS_C_NO_CREDENTIAL;
+    OM_uint32       iResult             = GSS_S_DEFECTIVE_CREDENTIAL;
+    OM_uint32       iMinorStatus;
+    OM_uint32       iMinorStatus2;
+    
+    const char *auth_param = NULL;
+    
+    *negotiate_response = "\0";
+    
+    if (conf->kerberos_keytab) {
+        char *ktname;
+        
+        // Don't use the APR allocator because we don't want it to be free'd by apache
+        ktname = malloc(strlen("KRB5_KTNAME=") + strlen(conf->kerberos_keytab) + 1);
+        if (ktname == NULL) {
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, 
+                          "Kerberos: malloc() failed; not enough memory");
+            response = HTTP_INTERNAL_SERVER_ERROR;
+            goto end;
+        }
+        
+        sprintf(ktname, "KRB5KTNAME=%s", conf->kerberos_keytab);
+        putenv(ktname);
+    }
+    
+    // Get/set the service principal
+    char tempBuffer[1024];
+    int have_server_principal = 
+        conf->kerberos_service_name && strchr(conf->kerberos_service_name, '/') != NULL;
+    if (have_server_principal) {
+        strncpy(tempBuffer, conf->kerberos_service_name, sizeof(tempBuffer));
+    }
+    else {
+        snprintf(tempBuffer, sizeof(tempBuffer), "%s@%s", 
+                 (conf->kerberos_service_name) ? conf->kerberos_service_name : SERVICE_NAME, 
+                 ap_get_server_name(r));
+    }
+    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, 
+                  "Kerberos: Service Name %s", tempBuffer);
+
+    pServiceName = tempBuffer;
+    
+    // Get the authorization parameter
+    auth_param = ap_getword_white(r->pool, &auth_line);
+    if (auth_param == NULL) {
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, 
+                      "Kerberos: No authorization parameter in request from client");
+        response = HTTP_UNAUTHORIZED;
+        goto end;
+    }
+    
+    iRecvTokenLength = apr_base64_decode_len(auth_param) + 1;
+    pRecvToken = apr_pcalloc(r->connection->pool, iRecvTokenLength);
+    if (pRecvToken == NULL) {
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "ap_pcalloc() failed (not enough memory)");
+        response = HTTP_INTERNAL_SERVER_ERROR;
+        goto end;
+    }
+    iRecvTokenLength = apr_base64_decode(pRecvToken, auth_param);
+    
+    iResult = AuthenticateGSS(r, pRecvToken, iRecvTokenLength, &pSendToken, &iSendTokenLength, 
+                              &pServiceName, &pUserPrincipal, &gssContext, &gssCreds);
+    
+    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, 
+                  "Kerberos: Verification returned code %d", iResult);
+    
+    if (iSendTokenLength) {
+        char *token = NULL;
+        size_t length;
+        
+        length = apr_base64_encode_len(iSendTokenLength) + 1;
+        token  = apr_pcalloc(r->connection->pool, length + 1);
+        
+        if (token == NULL) {
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "ap_pcalloc() failed; not enough memory");
+            response = HTTP_INTERNAL_SERVER_ERROR;
+            goto end;
+        }
+        
+        apr_base64_encode(token, pSendToken, iSendTokenLength);
+        token[length] = '\0';
+        *negotiate_response = token;
+        
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, 
+                      "Kerberos: GSS-API token of length %d bytes will be sent back", 
+                      iSendTokenLength);
+        
+        set_auth_headers(r, conf, 0, *negotiate_response);
+    }
+    
+    if (GSS_ERROR(iResult)) {
+        if (iRecvTokenLength > 7 && memcmp(pRecvToken, "NTLMSSP", 7) == 0) {
+            ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, 
+                          "Kerberos: received token seems to be NTLM");
+        }
+        
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "Kerberos: %s", 
+                      get_gss_error(r->pool, iResult, iMinorStatus, 
+                                    "gss_accept_sec_context failed"));
+        
+        // Don't offer the Negotiate method again if this fails
+        *negotiate_response = NULL;
+        response = HTTP_UNAUTHORIZED;
+        goto end;
+    }
+    
+    r->ap_auth_type = MECH_NEGOTIATE;
+    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "Kerberos: Setting user to %s", pSendToken);
+    r->user = apr_pstrdup(r->pool, pSendToken);
+
+    response = OK;
+    
+end:
+    // Clean up any context
+    if (gssContext != GSS_C_NO_CONTEXT) {
+        gss_delete_sec_context(&iMinorStatus, &gssContext, GSS_C_NO_BUFFER);
+        gssContext = GSS_C_NO_CONTEXT;
+    }
+    
+    // Clean up any credentials
+    if (gssCreds != GSS_C_NO_CREDENTIAL) {
+        gss_release_cred(&iMinorStatus, &gssCreds);
+        gssCreds = GSS_C_NO_CREDENTIAL;
+    }
+    
+    return response;
 }
 
+#pragma mark Password Authentication
 // -------------------------------------------------------------------------------------------------
 static int authn_ds_password(request_rec *r, authn_ds_config_t *conf, const char *auth_line)
 {
@@ -244,6 +577,24 @@ end:
     return response;
 }
 
+#pragma mark Authentication Phase
+// -------------------------------------------------------------------------------------------------
+// Inspired by mod_auth_kerb
+static int authn_already_succeeded(request_rec *r)
+{
+    //    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, 
+    //                  "Is initial request: %s", ap_is_initial_req(r) ? "Yes" : "No");
+    //    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, 
+    //                  "Auth type: %s", r->ap_auth_type);
+    
+    if (ap_is_initial_req(r) || r->ap_auth_type == NULL)
+        return 0;
+    if (strcmp(r->ap_auth_type, MECH_NEGOTIATE) || strcmp(r->ap_auth_type, "Basic")) {
+        return 1;
+    }
+    return 0;
+}
+
 // -------------------------------------------------------------------------------------------------
 static int authn_ds_authenticate(request_rec *r)
 {
@@ -281,7 +632,7 @@ static int authn_ds_authenticate(request_rec *r)
     
     if (!auth_line) {
         ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "No auth_line, sending headers");
-        set_auth_headers(r, conf, "\0");
+        set_auth_headers(r, conf, 1, "\0");
         return HTTP_UNAUTHORIZED;
     }
     
@@ -312,7 +663,7 @@ static int authn_ds_authenticate(request_rec *r)
     // If we are still unauthorized, send new headers and let them try again
     if (response == HTTP_UNAUTHORIZED) {
         ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "Received UNAUTHORIZED, send headers");
-        set_auth_headers(r, conf, "\0");
+        set_auth_headers(r, conf, 1, negotiate_response);
         return HTTP_UNAUTHORIZED;
     }
 
@@ -459,6 +810,7 @@ static void *create_authnz_ds_dir_config(apr_pool_t *p, char *d)
     conf->auth_authoritative = 1;
     conf->enable_kerberos = 0;
     conf->enable_basic = 1;
+    conf->kerberos_service_name = NULL;
     
     return conf;
 }
@@ -477,6 +829,14 @@ static void *create_authnz_ds_server_state(apr_pool_t *p, server_rec *s)
 }
 
 // -------------------------------------------------------------------------------------------------
+static const char * save_kerberos_realms(cmd_parms *cmd, void *vconf, const char *arg)
+{
+    authn_ds_config_t *conf = (authn_ds_config_t *)vconf;
+    conf->kerberos_realms = apr_pstrdup(cmd->pool, arg);
+    return NULL;
+}
+
+// -------------------------------------------------------------------------------------------------
 static const command_rec authnz_ds_cmds[] = 
 {
     AP_INIT_FLAG("AuthzDSAuthoritative", ap_set_flag_slot, 
@@ -492,6 +852,22 @@ static const command_rec authnz_ds_cmds[] =
     AP_INIT_FLAG("AuthnDSEnableBasic", ap_set_flag_slot, 
                  (void *)APR_OFFSETOF(authn_ds_config_t, enable_basic), OR_AUTHCFG, 
                  "Set to 'off' to disable Basic authentication"), 
+    
+    AP_INIT_TAKE1("AuthnDSKeytab", ap_set_file_slot, 
+                  (void *)APR_OFFSETOF(authn_ds_config_t, kerberos_keytab), OR_AUTHCFG, 
+                  "Specify the location of the Kerberos V5 keytab file"), 
+    
+    AP_INIT_TAKE1("AuthnDSRealms", save_kerberos_realms, 
+                  (void *)APR_OFFSETOF(authn_ds_config_t, kerberos_realms), OR_AUTHCFG, 
+                  "Specify the realms that Kerberos can authenticate against"), 
+    
+    AP_INIT_TAKE1("AuthnDSRealm", save_kerberos_realms, 
+                  (void *)APR_OFFSETOF(authn_ds_config_t, kerberos_realms), OR_AUTHCFG, 
+                  "Alias for AuthnDSRealms"), 
+    
+    AP_INIT_TAKE1("AuthnDSServiceName", ap_set_string_slot, 
+                  (void *)APR_OFFSETOF(authn_ds_config_t, kerberos_service_name), OR_AUTHCFG, 
+                  "The Kerberos service name"), 
     
     { NULL }
 };

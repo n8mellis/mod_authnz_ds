@@ -9,7 +9,7 @@ CFLAGS =
 # APXS_LDFLAGS	= ${shell [ -n "${LDFLAGS}"	 ] && echo ${LDFLAGS}	 | sed -e 's/\([^ ]*\)/-Wl,\1/g'}
 
 APXS_CPPFLAGS = -Wc,-I.
-APXS_LDFLAGS = -Wl,"-framework DirectoryService" -Wl,-lresolv
+APXS_LDFLAGS = -Wl,"-framework DirectoryService -framework Kerberos" -Wl,-lresolv
 
 # echo $(APXS_CPPFLAGS)
 
