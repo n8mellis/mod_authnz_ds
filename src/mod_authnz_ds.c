@@ -488,7 +488,7 @@ static int authn_ds_password(request_rec *r, authn_ds_config_t *conf, const char
     // Null-terminate the string
     decoded_line[length] = '\0';
     
-    cache_key = apr_pstrdup(r->pool, (const char *)decoded_line);
+    cache_key = apr_pstrdup(state->pool, (const char *)decoded_line);
     
     user = ap_getword_nulls(r->pool, (const char**)&decoded_line, ':');
     password = decoded_line;
@@ -519,7 +519,7 @@ static int authn_ds_password(request_rec *r, authn_ds_config_t *conf, const char
 #endif
     
     apr_time_t temp_now = apr_time_now();
-    apr_time_t *now = apr_palloc(r->pool, sizeof(apr_time_t));
+    apr_time_t *now = apr_palloc(state->pool, sizeof(apr_time_t));
     memcpy(now, &temp_now, sizeof(apr_time_t));
 
 //    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, 
@@ -563,17 +563,23 @@ static int authn_ds_password(request_rec *r, authn_ds_config_t *conf, const char
 
     if (result == 0) {
         // Cache the result so we don't have to look it up next time
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, 
+                      "[%" APR_PID_T_FMT "] Password check okay, caching result", getpid());
         apr_hash_set(state->cache, cache_key, APR_HASH_KEY_STRING, now);
         response = OK;
     }
     else {
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, 
+                      "[%" APR_PID_T_FMT "] Password check failed", getpid());
         response = HTTP_UNAUTHORIZED;
     }
     
 end:
+
 #if APR_HAS_THREADS
     apr_thread_mutex_unlock(state->lock);
 #endif
+    
     return response;
 }
 
@@ -648,11 +654,13 @@ static int authn_ds_authenticate(request_rec *r)
     
     // Do the proper authentication method
     if (strcasecmp(auth_type, MECH_NEGOTIATE) == 0) {
-        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "Do Kerberos Authentication");
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, 
+                      "[%" APR_PID_T_FMT "] Do Kerberos Authentication", getpid());
         response = authn_ds_kerberos(r, conf, auth_line, &negotiate_response);
     }
     else if (strcasecmp(auth_type, "Basic") == 0) {
-        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "Do Password Authentication");
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, 
+                      "[%" APR_PID_T_FMT "] Do Password Authentication", getpid());
         response = authn_ds_password(r, conf, auth_line);
     }
     else {
@@ -668,6 +676,7 @@ static int authn_ds_authenticate(request_rec *r)
     }
 
     last_response = response;
+    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "User: %s", r->user);
     return response;
 }
 
@@ -819,13 +828,37 @@ static void *create_authnz_ds_dir_config(apr_pool_t *p, char *d)
 static void *create_authnz_ds_server_state(apr_pool_t *p, server_rec *s)
 {
     authn_ds_state_t *state = (authn_ds_state_t *)apr_pcalloc(p, sizeof(authn_ds_state_t));
-    state->pool = p;
-#if APR_HAS_THREADS
-    apr_thread_mutex_create(&state->lock, APR_THREAD_MUTEX_DEFAULT, p);
-#endif
-    state->cache = apr_hash_make(p);
-    
     return state;
+}
+
+// -------------------------------------------------------------------------------------------------
+static void authnz_ds_child_init(apr_pool_t *pchild, server_rec *s)
+{
+    apr_status_t status;
+    
+    // Get the server config
+    authn_ds_state_t *state = ap_get_module_config(s->module_config, &authnz_ds_module);
+    
+    // Derive our own pool from pchild
+    status = apr_pool_create(&state->pool, pchild);
+    if (status != APR_SUCCESS) {
+        ap_log_perror(APLOG_MARK, APLOG_CRIT, status, pchild, 
+                      "Failed to create subpool for authn_ds_module");
+        return;
+    }
+    
+    // Set up a thread mutex for when we need to manipulate the cache
+#if APR_HAS_THREADS
+    status = apr_thread_mutex_create(&state->lock, APR_THREAD_MUTEX_DEFAULT, pchild);
+    if (status != APR_SUCCESS) {
+        ap_log_perror(APLOG_MARK, APLOG_CRIT, status, pchild, 
+                      "Failed to create mutex for authnz_ds_module");
+        return;
+    }
+#endif
+    
+    // Create the cache itself
+    state->cache = apr_hash_make(state->pool);
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -881,9 +914,13 @@ static int authnz_ds_post_config(apr_pool_t *p, apr_pool_t *plog, apr_pool_t *pt
 // -------------------------------------------------------------------------------------------------
 static void register_hooks(apr_pool_t *p)
 {
+    // Specify that the authorization here should take place BEFORE mod_authz_user
+    static const char *const aszPost[] = { "mod_authz_user.c", NULL };
+    
     ap_hook_post_config(authnz_ds_post_config, NULL, NULL, APR_HOOK_MIDDLE);
+    ap_hook_child_init(authnz_ds_child_init, NULL, NULL, APR_HOOK_MIDDLE);
     ap_hook_check_user_id(authn_ds_authenticate, NULL, NULL, APR_HOOK_MIDDLE);
-    ap_hook_auth_checker(authz_ds_authorize, NULL, NULL, APR_HOOK_MIDDLE);
+    ap_hook_auth_checker(authz_ds_authorize, NULL, aszPost, APR_HOOK_MIDDLE);
 }
 
 // -------------------------------------------------------------------------------------------------
