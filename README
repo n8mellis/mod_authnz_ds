@@ -1,0 +1,19 @@
+This module provides authentication and authorization for Apache through Apple's Directory 
+Services API.
+
+Usage
+=====
+
+From a command-line run:
+  ./configure && sudo make install
+
+Next, edit your httpd.conf file to add the following lines:
+
+  <Location />
+    AuthName "<My Secured Site>"
+    AuthType DirectoryServices
+  	Order allow,deny
+  	Allow from all
+  	Require group <special-people>
+  </Location>
+  
