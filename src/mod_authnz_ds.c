@@ -1,9 +1,139 @@
-/*
- * mod_authnz_ds
+/**
+ * File: mod_authnz_ds.c
+ * 
+ * User authentication and authorization module using Apple's Directory Services for Apache 2.x.
  *
- * User authentication and authorization via Apple's Directory Services for Apache 2.x
+ * I had need of an authentication module that would allow one to utilize their Kerberos ticket for 
+ * single-signon if they had it available, but be able to fall back to a Basic-type username and 
+ * password prompt if they did not have a Kerberos ticket or their browser did not support the 
+ * Negotiate protocol.  Both these methods needed to authenticate against a directory service 
+ * such as Open Directory or Active Directory.  
+ * 
+ * I also needed a module that would do authorization against this same directory.  The 
+ * mod_authnz_ldap module that is included in the Apache distribution served for a while but did 
+ * not allow us to do single-signon via Kerberos and there was no way to gracefully integrate the 
+ * two.  In addition, the version of Apache (specifically APR) that ships on Mac OS X was not built 
+ * with LDAP support and thus was not useable for our purpose.
  *
- * Written by: Nathan Mellis (nmellis@maf.org)
+ * This module is designed to fulfill all these needs.  It provides a two-pronged approach to 
+ * authentication and a simple but powerful authorization scheme.  Both the Negotiate and Basic 
+ * authentication methods are supported.  When Basic is used, it will authenticate the user against 
+ * the built-in Directory Services; enabling anyone who is listed in Directory Services to be 
+ * authenticated.  So, to add support for Active Directory integration, simply bind Open Directory 
+ * to Active Directory using the Directory Utility and you have instant AD authentication.
+ * 
+ * Similarly, with authorization, it will accept any user or group that is represented in Directory 
+ * Services.  Also, unlike the LDAP authorization module, this will support nested groups as well.
+ *
+ * Installation
+ * ============
+ * 
+ * The module must be compiled using apxs, which comes with your Apache distribution.  The supplied 
+ * Makefile will do this for you.  Simply run:
+ * 
+ *   %> ./configure
+ *   %> make
+ *   %> sudo make install
+ *
+ * It will compile the module and install it in Apache's modules directory and add the LoadModule 
+ * statement to your httpd.conf.  It will be enabled by default so if you don't want to use it 
+ * right away, simply comment it out.
+ * 
+ * 
+ * Usage
+ * =====
+ * 
+ * Authentication
+ * --------------
+ * To enable authentication for a directory, simply add the following lines to the Location section 
+ * of your httpd.conf file:
+ * 
+ * Example:
+ * (start example)
+ * <Location /secured/>
+ *   AuthName "My Secured Site"
+ *   AuthType DirectoryServices
+ * </Location>
+ * (end example)
+ *
+ * There should also be an Order statement (e.g. Order allow,deny) and an Allow or Deny statement 
+ * (e.g. Allow from all)
+ *
+ * Authorization
+ * -------------
+ * To enable authorization, simply provide a Require statement like the following:
+ * 
+ *   Require group admin
+ *
+ * Any group that is accessible by Directory Services can be named here and more than one group 
+ * can be specified (e.g. Require group admin www).
+ *
+ * Additionally, one or more of the following directives may be specified to customize the behavior 
+ * of the module.  See below for more information.
+ *
+ * So a complete Location with both Kerberos and Basic would look like the following:
+ *
+ * Example:
+ * (start example)
+ * <Location /secured/>
+ *   AuthName "My Secured Site"
+ *   AuthType DirectoryServices
+ *   AuthnDSEnableKerberos On
+ *   AuthnDSEnableBasic On
+ *   Order allow,deny
+ *   Allow from all
+ *   Require group admin
+ * </Location>
+ * (end example)
+ * 
+ * 
+ * Directives
+ * ==========
+ * 
+ * AuthnDSAuthoritative
+ *   'On' or 'Off'; specifies if lower modules should be given the opportunity to response to 
+ *   requests if this returns DECLINED.
+ *
+ * AuthnDSEnableKerberos
+ *   'On' or 'Off'; specifies if Kerberos authentication via the Negotiate protocol is enabled.  
+ *   Default is 'Off'.
+ *
+ * AuthnDSEnableBasic
+ *   'On' or 'Off'; specifies if username/password authentication via the Basic protocol is 
+ *   enabled.  Default is 'On'.
+ *
+ * AuthnDSKeytab
+ *   Specifies the location of the Kerberos keytab file.
+ * 
+ * AuthnDSRealms (also AuthnDSRealm)
+ *   Specifies the Kerberos realm(s) that tickets should be accepted for.
+ * 
+ * AuthnDSServiceName
+ *   Specifies the service name; typically "HTTP".
+ * 
+ * 
+ * Credits:
+ * 
+ *   Written by Nathan Mellis (nmellis@maf.org).
+ * 
+ * Copyright / License:
+ * 
+ *   Copyright 2007 Mission Aviation Fellowship
+ * 
+ *   Licensed under the Apache License, Version 2.0 (the "License");
+ *   you may not use this file except in compliance with the License.
+ *   You may obtain a copy of the License at
+ * 
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ * 
+ *   Unless required by applicable law or agreed to in writing, software
+ *   distributed under the License is distributed on an "AS IS" BASIS,
+ *   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *   See the License for the specific language governing permissions and
+ *   limitations under the License.
+ * 
+ * Version:
+ *   $Id$ 
  */
 
 #include "ap_provider.h"
@@ -32,11 +162,13 @@
 #include <Kerberos/Kerberos.h>
 
 // These methods aren't exported in the headers
+// I found these in the Apple Calendar Server AppleAuth file so they must be okay to use.
 int checkpw(const char* username, const char* password);
 int mbr_reset_cache(void);
 int mbr_user_name_to_uuid(const char* name, uuid_t uu);
 int mbr_group_name_to_uuid(const char* name, uuid_t uu);
 
+// Define some constants
 #define MECH_NEGOTIATE "Negotiate"
 #define SERVICE_NAME "HTTP"
 
@@ -74,22 +206,28 @@ typedef struct {
     apr_hash_t *cache;              // Authentication cache
 } authn_ds_state_t;
 
-// -------------------------------------------------------------------------------------------------
-// authn_ds_cache_entry_t definition
-// -------------------------------------------------------------------------------------------------
-typedef struct {
-    const char *user;
-    const char *password;
-    apr_time_t time;
-} authn_ds_cache_entry_t;
-
 
 
 #pragma mark -
 // -------------------------------------------------------------------------------------------------
 // Authentication Phase
 // -------------------------------------------------------------------------------------------------
-// Inspired by mod_auth_kerb
+/**
+ * Method: set_auth_headers
+ *
+ * Sets the headers of the incoming request if no authorization headers were sent or the 
+ * authorization failed.  If Kerberos is enabled it will give priority to the Negotiate protocol.
+ * 
+ * Parameters:
+ *   request_rec *r           - the current request object
+ *   authn_ds_config_t *conf  - the per-directory configuration for this process
+ *   int use_password         - `true` if we should allow Basic authentication to be an option for 
+ *                              this request
+ *   char *negotiate_response - the response from <authn_ds_kerberos>.  If NULL, Negotiate is 
+ *                              disabled.  If a null string (e.g. '\0'), Negotiate is added as an 
+ *                              authorization header.  Otherwise it is the response from a previous 
+ *                              Negotiate response step and will be sent to the client.
+ */
 static void set_auth_headers(request_rec *r, authn_ds_config_t *conf, int use_password, 
                              char *negotiate_response)
 {
@@ -118,7 +256,7 @@ static void set_auth_headers(request_rec *r, authn_ds_config_t *conf, int use_pa
 #pragma mark Kerberos Authentication
 // -------------------------------------------------------------------------------------------------
 // Taken from mod_auth_kerb
-static const char * get_gss_error(apr_pool_t *p, OM_uint32 majorError, OM_uint32 minorError, 
+static const char *get_gss_error(apr_pool_t *p, OM_uint32 majorError, OM_uint32 minorError, 
                                  char *prefix)
 {
     OM_uint32 majorStatus, minorStatus;
@@ -149,7 +287,7 @@ static const char * get_gss_error(apr_pool_t *p, OM_uint32 majorError, OM_uint32
 }
 
 // -------------------------------------------------------------------------------------------------
-// Taken from Apple Sample Code Network Authenticate/GSSauthenticate.c
+// Taken from Apple Sample Code: Network Authenticate/GSSauthenticate.c
 static int AcquireGSSCredentials(request_rec *r, const char *inServiceName, 
                                  gss_cred_id_t *outServiceCredentials)
 {
@@ -222,7 +360,7 @@ static int AcquireGSSCredentials(request_rec *r, const char *inServiceName,
 }
 
 // -------------------------------------------------------------------------------------------------
-// Taken from Apple Sample Code Network Authenticate/GSSauthenticate.c
+// Taken from Apple Sample Code: Network Authenticate/GSSauthenticate.c
 static OM_uint32 AuthenticateGSS(request_rec *r, char *inToken, int inTokenLength, 
                                  char **outToken, int *outTokenLength, 
                                  char **inOutServiceName, char **outUserPrincipal, 
