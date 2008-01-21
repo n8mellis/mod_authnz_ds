@@ -1,3 +1,5 @@
+// Commented using NaturalDocs (http://www.naturaldocs.org)
+
 /**
  * File: mod_authnz_ds.c
  * 
@@ -87,8 +89,8 @@
  * (end example)
  * 
  * 
- * Directives
- * ==========
+ * Configuration Directives
+ * ========================
  * 
  * AuthnDSAuthoritative
  *   'On' or 'Off'; specifies if lower modules should be given the opportunity to response to 
@@ -105,11 +107,11 @@
  * AuthnDSKeytab
  *   Specifies the location of the Kerberos keytab file.
  * 
- * AuthnDSRealms (also AuthnDSRealm)
- *   Specifies the Kerberos realm(s) that tickets should be accepted for.
- * 
  * AuthnDSServiceName
  *   Specifies the service name; typically "HTTP".
+ *
+ * AuthnDSCacheTTL
+ *   Specifies the number of seconds that cached passwords should be honored; default = 300
  * 
  * 
  * Credits:
@@ -118,7 +120,7 @@
  * 
  * Copyright / License:
  * 
- *   Copyright 2007 Mission Aviation Fellowship
+ *   Copyright 2008 Mission Aviation Fellowship
  * 
  *   Licensed under the Apache License, Version 2.0 (the "License");
  *   you may not use this file except in compliance with the License.
@@ -168,20 +170,41 @@ int mbr_reset_cache(void);
 int mbr_user_name_to_uuid(const char* name, uuid_t uu);
 int mbr_group_name_to_uuid(const char* name, uuid_t uu);
 
-// Define some constants
+/**
+ * Constant: MECH_NEGOTIATE
+ * Default Negotiate identifier.  Value = "Negotiate"
+ */
 #define MECH_NEGOTIATE "Negotiate"
+
+/**
+ * Constant: SERVICE_NAME
+ * Default Kerberos service name.  Value = "HTTP"
+ */
 #define SERVICE_NAME "HTTP"
 
 
 #pragma mark -
 #pragma mark Module Config definitions
+
 // -------------------------------------------------------------------------------------------------
 module AP_MODULE_DECLARE_DATA authnz_ds_module;
 // -------------------------------------------------------------------------------------------------
 
-// -------------------------------------------------------------------------------------------------
-// authn_ds_config_t definition
-// -------------------------------------------------------------------------------------------------
+/**
+ * Struct: authn_ds_config_t
+ *
+ * Contains the per-directory configuration information.
+ *
+ * Properties:
+ *   apr_pool_t *pool                  - a pointer to an allocation pool
+ *   apr_thread_mutex_t *lock          - a pointer to the default thread mutex
+ *   int auth_authoritative            - value of AuthnDSAuthoritative; default = 1
+ *   int enable_kerberos               - value of AuthnDSEnableKerberos; default = 0
+ *   int enable_basic                  - value of AuthnDSEnableBasic; default = 1
+ *   char *kerberos_keytab             - value of AuthDSKeytab
+ *   const char *kerberos_service_name - value of AuthnDSServiceName; default = HTTP
+ *   int cache_ttl                     - value of AuthnDSCacheTTL; default = 300
+ */
 typedef struct {
     apr_pool_t *pool;                   // Pool that this config is allocated from
 #if APR_HAS_THREADS
@@ -193,11 +216,19 @@ typedef struct {
     char *kerberos_keytab;              // Location of the Kerberos keytab file
     char *kerberos_realms;              // The Kerberos realms to look in
     const char *kerberos_service_name;  // The service name for Kerberos, usually HTTP
+    int cache_ttl;                      // The TTL for cache entries in seconds
 } authn_ds_config_t;
 
-// -------------------------------------------------------------------------------------------------
-// authn_ds_state_t definition
-// -------------------------------------------------------------------------------------------------
+/**
+ * Struct: authn_ds_state_t
+ *
+ * Contains the information related to the server-thead state.
+ *
+ * Properties:
+ *   apr_pool_t *pool         - a pointer to a server-thread-level allocation pool
+ *   apr_thread_mutex_t *lock - a pointer to the default thread mutex
+ *   apr_hash_t *cache        - a pointer to a hash that will contain the password cache
+ */
 typedef struct {
     apr_pool_t *pool;               // Pool that this config is allocated from
 #if APR_HAS_THREADS
@@ -209,11 +240,13 @@ typedef struct {
 
 
 #pragma mark -
+
 // -------------------------------------------------------------------------------------------------
 // Authentication Phase
 // -------------------------------------------------------------------------------------------------
+
 /**
- * Method: set_auth_headers
+ * Function: set_auth_headers
  *
  * Sets the headers of the incoming request if no authorization headers were sent or the 
  * authorization failed.  If Kerberos is enabled it will give priority to the Negotiate protocol.
@@ -234,29 +267,48 @@ static void set_auth_headers(request_rec *r, authn_ds_config_t *conf, int use_pa
     const char *auth_name = NULL;
     char *negotiate_params;
     const char *header_name = 
-    (r->proxyreq == PROXYREQ_PROXY) ? "Proxy-Authenticate" : "WWW-Authenticate";
+        (r->proxyreq == PROXYREQ_PROXY) ? "Proxy-Authenticate" : "WWW-Authenticate";
     
     // Get the auth name
     auth_name = ap_auth_name(r);
     
     // Add the headers for Negotiate method if enabled
-    if (conf->enable_kerberos && negotiate_response != NULL) {
+    if (negotiate_response != NULL && conf->enable_kerberos) {
         ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "Negotiate Response: %s", negotiate_response);
         negotiate_params = (*negotiate_response == '\0') ? 
             MECH_NEGOTIATE : apr_pstrcat(r->pool, MECH_NEGOTIATE " ", negotiate_response, NULL);
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "Negotiate Params: %s", negotiate_params);
         apr_table_add(r->err_headers_out, header_name, negotiate_params);
     }
     
     // Add the headers for Basic if enabled
-    if (conf->enable_basic && use_password) {
+    if (use_password && conf->enable_basic) {
         apr_table_add(r->err_headers_out, header_name, 
                       apr_pstrcat(r->pool, "Basic realm=\"", auth_name, "\"", NULL));
     }
 }
 
 #pragma mark Kerberos Authentication
+
 // -------------------------------------------------------------------------------------------------
-// Taken from mod_auth_kerb
+
+/**
+ * Function: get_gss_error
+ *
+ * Takes a GSS error message and returns a string-representation of the message containing the 
+ * major and minor errors appended to the string provided in `prefix`.
+ *
+ * Used from mod_auth_kerb.
+ *
+ * Parameters:
+ *   apr_pool_t *p        - a pointer to the pool to allocate memory from
+ *   OM_uint32 majorError - a 32-bit integer specifying the major GSS error that was received
+ *   OM_uint32 minorError - a 32-bit integer specifying the minor GSS error that was received
+ *   char *prefix         - a pointer to a string that should prefix the error output
+ *
+ * Returns:
+ *   A string representation of the GSS errors that were received.
+ */
 static const char *get_gss_error(apr_pool_t *p, OM_uint32 majorError, OM_uint32 minorError, 
                                  char *prefix)
 {
@@ -288,6 +340,23 @@ static const char *get_gss_error(apr_pool_t *p, OM_uint32 majorError, OM_uint32 
 }
 
 // -------------------------------------------------------------------------------------------------
+
+/**
+ * Function: get_gss_creds
+ *
+ * Fetches the credentials for this server to act as an authentication agent for Kerberos.  The 
+ * credentials for the server will be placed in `serverCreds`.
+ *
+ * Inspired by mod_auth_kerb.
+ *
+ * Parameters:
+ *   request_rec *r             - a pointer to the current request object
+ *   authn_ds_config_t *conf    - a pointer to the per-directory configuration for the module
+ *   gss_cred_it_t *serverCreds - a pointer to a variable that will hold the server credentials
+ *
+ * Returns:
+ *   OK or HTTP_INTERNAL_SERVER_ERROR
+ */
 static int get_gss_creds(request_rec *r, authn_ds_config_t *conf, gss_cred_id_t *serverCreds)
 {
     gss_buffer_desc token = GSS_C_EMPTY_BUFFER;
@@ -342,10 +411,28 @@ static int get_gss_creds(request_rec *r, authn_ds_config_t *conf, gss_cred_id_t 
         return HTTP_INTERNAL_SERVER_ERROR;
     }
     
-    return 0;
+    return OK;
 }
 
 // -------------------------------------------------------------------------------------------------
+
+/**
+ * Function: authn_ds_kerberos
+ *
+ * Does Kerberos authentication for the supplied credentials.
+ *
+ * TODO: Document this function once it's done.
+ *
+ * Parameters:
+ *   request_rec *r            - a pointer to the current request object
+ *   authn_ds_config_t *conf   - a pointer to the per-directory configuration for the module
+ *   const char *auth_line     - a pointer to the authentication line that was sent from the client 
+ *                               in the request headers
+ *   char **negotiate_response - a variable to hold the output from the Negotiate procedure
+ *
+ * Returns:
+ *   OK, HTTP_UNAUTHORIZED, or HTTP_INTERNAL_SERVER_ERROR
+ */
 static int authn_ds_kerberos(request_rec *r, authn_ds_config_t *conf, const char *auth_line, 
                              char **negotiate_response)
 {
@@ -355,21 +442,30 @@ static int authn_ds_kerberos(request_rec *r, authn_ds_config_t *conf, const char
         (authn_ds_state_t *)ap_get_module_config(r->server->module_config, &authnz_ds_module);
     
     OM_uint32 majorStatus, minorStatus, minorStatus2;
-    gss_buffer_desc inputToken = GSS_C_EMPTY_BUFFER;
-    gss_buffer_desc outputToken = GSS_C_EMPTY_BUFFER;
-    const char *authParam = NULL;
     
-    gss_name_t clientName = GSS_C_NO_NAME;
+    gss_buffer_desc inputToken  = GSS_C_EMPTY_BUFFER;
+    gss_buffer_desc outputToken = GSS_C_EMPTY_BUFFER;
+    const char *authParam       = NULL;
+    
+    gss_name_t    clientName    = GSS_C_NO_NAME;
     gss_cred_id_t delegatedCred = GSS_C_NO_CREDENTIAL;
-    gss_ctx_id_t context = GSS_C_NO_CONTEXT;
-    gss_cred_id_t serverCreds = GSS_C_NO_CREDENTIAL;
+    gss_ctx_id_t  context       = GSS_C_NO_CONTEXT;
+    gss_cred_id_t serverCreds   = GSS_C_NO_CREDENTIAL;
     
     *negotiate_response = "\0";
 
     if (conf->kerberos_keytab) {
         apr_status_t s;
-        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "Setting keytab environment");
-        s = apr_env_set("KRB5_KTNAME", conf->kerberos_keytab, state->pool);
+        char *kt;
+        s = apr_env_get(&kt, "KRB5_KTNAME", conf->pool);
+        if (strcmp(kt, conf->kerberos_keytab) != 0) {
+            ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "Setting keytab environment");
+            s = apr_env_set("KRB5_KTNAME", conf->kerberos_keytab, state->pool);
+        }
+        else {
+            ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, 
+                          "Using existing keytab environment: %s", kt);
+        }
     }
     
     response = get_gss_creds(r, conf, &serverCreds);
@@ -389,20 +485,20 @@ static int authn_ds_kerberos(request_rec *r, authn_ds_config_t *conf, const char
     inputToken.length = apr_base64_decode_len(authParam) + 1;
     inputToken.value = apr_pcalloc(r->connection->pool, inputToken.length);
     if (inputToken.value == NULL) {
-        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "ap_pcalloc failed: not enough memory");
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "apr_pcalloc failed: not enough memory");
         response = HTTP_INTERNAL_SERVER_ERROR;
         goto end;
     }
-    
     inputToken.length = apr_base64_decode(inputToken.value, authParam);
 //    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, 
 //                  "Input Token: %s", inputToken.value);
     
     majorStatus = gss_accept_sec_context(&minorStatus, &context, serverCreds, &inputToken, 
                                          GSS_C_NO_CHANNEL_BINDINGS, &clientName, NULL, 
-                                         &outputToken, NULL, NULL, &delegatedCred);
+                                         &outputToken, NULL, NULL, NULL);
     
-    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "Verification returned code %d", majorStatus);
+    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "Verification returned major code %d", majorStatus);
+    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "Verification returned minor code %d", minorStatus);
     
     if (outputToken.length) {
         char *token = NULL;
@@ -411,7 +507,7 @@ static int authn_ds_kerberos(request_rec *r, authn_ds_config_t *conf, const char
         length = apr_base64_encode_len(outputToken.length) + 1;
         token = apr_pcalloc(r->connection->pool, length + 1);
         if (token == NULL) {
-            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "ap_pcalloc failed: not enough memory");
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "apr_pcalloc failed: not enough memory");
             response = HTTP_INTERNAL_SERVER_ERROR;
             gss_release_buffer(&minorStatus2, &outputToken);
             goto end;
@@ -425,6 +521,9 @@ static int authn_ds_kerberos(request_rec *r, authn_ds_config_t *conf, const char
                       "GSS-API token of length %d bytes will be sent back", outputToken.length);
         gss_release_buffer(&minorStatus2, &outputToken);
         set_auth_headers(r, conf, 0, *negotiate_response);
+    }
+    else {
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "Output token has 0 length");
     }
     
     if (GSS_ERROR(majorStatus)) {
@@ -463,35 +562,67 @@ static int authn_ds_kerberos(request_rec *r, authn_ds_config_t *conf, const char
     else
         r->user = apr_pstrndup(r->pool, user, realm - user);
     
-    // TODO: Store the credentials?
-    
     gss_release_buffer(&minorStatus, &outputToken);
     
     response = OK;
     
 end:
-    if (delegatedCred != GSS_C_NO_CREDENTIAL) {
+    if (delegatedCred != GSS_C_NO_CREDENTIAL)
         gss_release_cred(&minorStatus, &delegatedCred);
-        delegatedCred = GSS_C_NO_CREDENTIAL;
-    }
+
     if (outputToken.length)
         gss_release_buffer(&minorStatus, &outputToken);
+    
     if (clientName != GSS_C_NO_NAME)
         gss_release_name(&minorStatus, &clientName);
-    if (context != GSS_C_NO_CONTEXT) {
-        gss_delete_sec_context(&minorStatus, &context, GSS_C_NO_BUFFER);
-        context = GSS_C_NO_CONTEXT;
-    }
-    if (serverCreds != GSS_C_NO_CREDENTIAL) {
+    
+    if (serverCreds != GSS_C_NO_CREDENTIAL)
         gss_release_cred(&minorStatus, &serverCreds);
-        serverCreds = GSS_C_NO_CREDENTIAL;
-    }
+    
+    if (context != GSS_C_NO_CONTEXT)
+        gss_delete_sec_context(&minorStatus, &context, GSS_C_NO_BUFFER);
     
     return response;
 }
 
 #pragma mark Password Authentication
+
 // -------------------------------------------------------------------------------------------------
+
+/**
+ * Function authn_ds_password
+ *
+ * Performs Basic authentication against Directory Services using the username and password that 
+ * were sent in by the client.
+ *
+ * The username and password are sent in the auth_line as a Base64 encoded string.  After decoding 
+ * and splitting, the username and password are passed to the (un-documented) `checkpw` function 
+ * which will do the actual authentication against Directory Services.
+ *
+ * The `checkpw` function is very slow so caching has been implemented in the per-server-thread 
+ * hash created for this purpose.  If authentication is successful, it will store the 
+ * username/password combo as the key and a timestamp as the value.  When this function is called 
+ * again, it checks to see if there is a key in the hash with the username/password supplied.  If 
+ * there is, it checks to see if the timestamp is less than the cache TTL which defaults to 5 
+ * minutes.  If it is, then it automatically passes authentication.  If it isn't, it deletes the 
+ * cache entry and proceeds with the actual authentication check.
+ *
+ * Since we are reading and writing from a shared hash, we have to lock the thread before we do 
+ * any reading or writing from it to ensure that we have valid data.  We use the thread mutex 
+ * defined in authn_ds_state_t to do this.
+ *
+ * Whether or not authentication succeeds, the `user` and `ap_auth_type` properties of the request 
+ * object are set to the supplied username and "Basic" respectively.
+ *
+ * Parameters:
+ *   request_rec *r          - a pointer to the current request object
+ *   authn_ds_config_t *conf - a pointer to the per-directory configuration for the module
+ *   const char *auth_line   - a pointer to the authentication line that was sent from the client 
+ *                             in the request headers
+ *
+ * Returns:
+ *   OK or HTTP_UNAUTHORIZED
+ */
 static int authn_ds_password(request_rec *r, authn_ds_config_t *conf, const char *auth_line)
 {
     authn_ds_state_t *state = 
@@ -558,8 +689,8 @@ static int authn_ds_password(request_rec *r, authn_ds_config_t *conf, const char
         ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, 
                       "[%" APR_PID_T_FMT "] Cache: We have a cached value", getpid());
         // We have a cached value.  Check to see if it is expired
-        // Check to see if the cached value is less than five minutes old
-        is_valid = (*now - *cached_value) < apr_time_from_sec(300);
+        // Check to see if the cached value is less than the cache_ttl (default 5 minutes)
+        is_valid = (*now - *cached_value) < apr_time_from_sec(conf->cache_ttl);
         
         if (is_valid) {
             // We have a valid and current cache entry, assume authentication will pass
@@ -608,26 +739,74 @@ end:
     return response;
 }
 
+
 #pragma mark Authentication Phase
+
 // -------------------------------------------------------------------------------------------------
-// Inspired by mod_auth_kerb
+
+/**
+ * Function: authn_already_succeeded
+ *
+ * Determines if the request has already succeeded authentication.
+ *
+ * Inspired by mod_auth_kerb.
+ *
+ * Parameters:
+ *   request_rec *r - a pointer to the current request object
+ *
+ * Returns:
+ *   `1` if the request has already passed authentication; 
+ *   `0` otherwise
+ */
 static int authn_already_succeeded(request_rec *r)
 {
     ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, 
                   "Is initial request: %s", ap_is_initial_req(r) ? "Yes" : "No");
-    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, 
-                  "Auth type: %s", r->ap_auth_type);
+    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "Auth type: %s", r->ap_auth_type);
+    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "User: %s", r->user);
     
     if (ap_is_initial_req(r) || r->ap_auth_type == NULL)
         return 0;
     if (strcmp(r->ap_auth_type, MECH_NEGOTIATE) || 
-        (strcmp(r->ap_auth_type, "Basic") && strlen(r->user) != 0)) {
+        (strcmp(r->ap_auth_type, "Basic") && strlen(r->user) > 0)) {
         return 1;
     }
     return 0;
 }
 
 // -------------------------------------------------------------------------------------------------
+
+/**
+ * Function: authn_ds_authenticate
+ *
+ * Performs authentication for the user.
+ *
+ * This is a multi-step process.  First, if the request object does not have an 'Authorization' 
+ * header, it will set the output headers to the forms of authentication that are accepted by the 
+ * module.  This will include Kerberos (via Negotiate), Basic, or both.  If both are given, 
+ * preference is given to Kerberos (Negotiate).  It then sends back a '401 Unauthorized' allowing 
+ * the client to supply authentication credentials.  Once the client sends back the request with 
+ * its authentication credentials, it will determine whether or not the client responded with 
+ * Negotiate or Basic and do the appropriate check.
+ *
+ * If the authentication method that comes back from the client is neither Negotiate nor Basic, it 
+ * will return DECLINED, allowing a lower authentication module to do the authentication check.
+ *
+ * If the response comes back HTTP_UNAUTHORIZED, it will set the headers again and return a '401' 
+ * allowing the user to try again.  It is also adaptive in that if, for example, Kerberos fails 
+ * because it is not able to verify tickets on the domain that the user supplied, it will not 
+ * offer Kerberos (Negotiate) again as an authentication option.
+ *
+ * Once the user has been authenticated, it sets the `user` property of the request object to the 
+ * canonical name of the user who was authenticated (e.g. 'juser') for use in scripts, etc. through 
+ * the REMOTE_USER CGI variable.
+ *
+ * Parameters:
+ *   request_rec *r - a pointer to the current request object
+ *
+ * Returns:
+ *   OK, DECLINED, or HTTP_UNAUTHORIZED
+ */
 static int authn_ds_authenticate(request_rec *r)
 {
     authn_ds_config_t *conf = 
@@ -668,12 +847,13 @@ static int authn_ds_authenticate(request_rec *r)
         return HTTP_UNAUTHORIZED;
     }
     
-    auth_type = ap_getword_white(r->pool, &auth_line);
-    
     if (authn_already_succeeded(r)) {
         ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "Already Succeeded");
         return last_response;
     }
+
+    auth_type = ap_getword_white(r->pool, &auth_line);
+    
     
     // Reset the response to a default of unauthorized
     response = HTTP_UNAUTHORIZED;
@@ -706,11 +886,29 @@ static int authn_ds_authenticate(request_rec *r)
     return response;
 }
 
+
 #pragma mark -
 #pragma mark Authorization Phase
+
 // -------------------------------------------------------------------------------------------------
 // Authorization Phase
 // -------------------------------------------------------------------------------------------------
+
+/**
+ * Function: check_membership
+ *
+ * Takes the supplied username and group name and determines if `user` is a member of `group`.
+ *
+ * Parameters:
+ *   const char *user  - a pointer to the string that contains the username
+ *   const char *group - a pointer to the string that contains the group name
+ *
+ * Returns:
+ *   -1 if the user could not be found, 
+ *   -2 if the group could not be found, 
+ *   -3 if `user` is not a member of `group`, 
+ *    0 otherwise
+ */
 static int check_membership(const char *user, const char *group)
 {
     //(void)mbr_reset_cache();
@@ -740,7 +938,47 @@ static int check_membership(const char *user, const char *group)
 }
 
 // -------------------------------------------------------------------------------------------------
-// Inspired by mod_authnz_ldap
+
+/**
+ * Function: authz_ds_authorize
+ *
+ * Checks to see if the user is authorized to access the resource.
+ *
+ * Access rules may be specified in your httpd.conf file using the "Require" directive.  This 
+ * module supports access checking by either user or group and may be supplied with any user or 
+ * group that is readable by Directory Services.
+ *
+ * Additionally, you may specify more than one user or group as a space-separated list 
+ * (e.g. Require group intranet OR Require group intranet admin)
+ *
+ * This method also supports nested groups since it uses the built-in (though un-documented) 
+ * `mbr_check_membership` method which will traverse group hierarchies to determine group
+ * membership.
+ *
+ * To find out what groups or users are available, see the following:
+ *
+ * (start example)
+ * % dscl
+ * > cd /Search/Groups
+ * > ls
+ * => All available groups
+ *
+ * > cd /Search/Users
+ * > ls
+ * => All available users
+ * (end example)
+ * 
+ * Inspired by mod_authnz_ldap.
+ *
+ * Parameters:
+ *   request_rec *r - a pointer to the current request object
+ *
+ * Returns:
+ *   OK, DECLINED, or HTTP_UNAUTHORIZED
+ *
+ * See Also:
+ *   <check_membership>
+ */
 static int authz_ds_authorize(request_rec *r)
 {
     authn_ds_config_t *conf =
@@ -834,7 +1072,33 @@ static int authz_ds_authorize(request_rec *r)
 
 #pragma mark -
 #pragma mark Apache Module Configuration
+
 // -------------------------------------------------------------------------------------------------
+
+/**
+ * Function: create_authnz_ds_dir_config
+ *
+ * Allocates memory for and creates the per-directory configuration for the module and sets 
+ * defaults for the configuration options.  Defaults are set as follows:
+ *
+ *   lock                   - the default thread mutex
+ *   auth_authoritative     - 1
+ *   enable_kerberos        - 0
+ *   enable_basic           - 1
+ *   kerberos_service_name  - NULL
+ *
+ * The thread lock is only set if APR supports threads.
+ *
+ * The following parameters are supplied automatically by Apache when the module is loaded.  This 
+ * method should be set for the per-directory config parameter when setting up the module.
+ *
+ * Parameters:
+ *   apr_pool_t *p - a pointer to the allocation pool for the per-directory configuration object
+ *   char *d - a pointer to the name of the directory that we are configuring
+ *
+ * Returns:
+ *   A pointer to the newly created and defaulted configuration authn_ds_config_t object.
+ */
 static void *create_authnz_ds_dir_config(apr_pool_t *p, char *d)
 {
     authn_ds_config_t *conf = (authn_ds_config_t *)apr_pcalloc(p, sizeof(authn_ds_config_t));
@@ -842,15 +1106,32 @@ static void *create_authnz_ds_dir_config(apr_pool_t *p, char *d)
 #if APR_HAS_THREADS
     apr_thread_mutex_create(&conf->lock, APR_THREAD_MUTEX_DEFAULT, p);
 #endif
-    conf->auth_authoritative = 1;
-    conf->enable_kerberos = 0;
-    conf->enable_basic = 1;
+    conf->auth_authoritative    = 1;
+    conf->enable_kerberos       = 0;
+    conf->enable_basic          = 1;
     conf->kerberos_service_name = NULL;
+    conf->cache_ttl             = 300;
     
     return conf;
 }
 
 // -------------------------------------------------------------------------------------------------
+
+/**
+ * Function: create_authnz_ds_server_state
+ * 
+ * Allocates memory for and creates the server configuration for the module.
+ *
+ * The following parameters are supplied automatically by Apache when the module is loaded.  This 
+ * method should be set for the server config parameter when setting up the module.
+ *
+ * Parameters:
+ *   apr_pool_t *p - a pointer to the allocation pool for the server configuration object
+ *   server_rec *s - a pointer to the server_rec object that was instantiated
+ *
+ * Returns:
+ *   A pointer to the newly created and defaulted configuration authn_ds_state_t object.
+ */
 static void *create_authnz_ds_server_state(apr_pool_t *p, server_rec *s)
 {
     authn_ds_state_t *state = (authn_ds_state_t *)apr_pcalloc(p, sizeof(authn_ds_state_t));
@@ -858,6 +1139,21 @@ static void *create_authnz_ds_server_state(apr_pool_t *p, server_rec *s)
 }
 
 // -------------------------------------------------------------------------------------------------
+
+/**
+ * Function: authnz_ds_child_init
+ *
+ * Sets up the authn_ds_state_t object.
+ *
+ * The primary purpose of this is to create a new pool and hash for storing the cached password 
+ * authentiation credentials for each server thread that gets spawned.
+ *
+ * This method is called automatically from the child_init hook.
+ *
+ * Parameters:
+ *   apr_pool_t *pchild - a pointer to the pool for this particular server thread
+ *   server_rec *s      - a pointer to the server request object
+ */
 static void authnz_ds_child_init(apr_pool_t *pchild, server_rec *s)
 {
     apr_status_t status;
@@ -896,6 +1192,29 @@ static const char * save_kerberos_realms(cmd_parms *cmd, void *vconf, const char
 }
 
 // -------------------------------------------------------------------------------------------------
+
+/**
+ * Array: authnz_ds_cmds
+ *
+ * Specifies the configuration commands that this module accepts.  They are as follows:
+ *
+ *   AuthzDSAuthoritative  - On/Off; if 'Off', will allow lower modules a chance at authorization; 
+ *                           Default = On
+ *   AuthnDSEnableKerberos - On/Off; if 'On', will supply HTTP Negotiate as a possible 
+ *                           authentication method to allow Kerberos-enabled clients single-signon;
+ *                           Default = Off
+ *   AuthnDSEnableBasic    - On/Off; if 'On', will supply Basic as a possible authentication method 
+ *                           to allow non-Kerberos enabled clients to supply a plain-text username 
+ *                           and password to authenticate.  Should only be used over SSL;
+ *                           Default = On
+ *   AuthnDSKeytab         - the full path to the Kerberos keytab that specifies the service 
+ *                           principal that this server will use
+ *                           authentication; only necessary if AuthnDSEnableKerberos is enabled.
+ *   AuthnDSServiceName    - the name of the service that has been registered with the Kerberos 
+ *                           server; Optional; Default = HTTP
+ *   AuthnDSCacheTTL       - the number of seconds cached password entries should be honored; 
+ *                           Default = 300
+ */
 static const command_rec authnz_ds_cmds[] = 
 {
     AP_INIT_FLAG("AuthzDSAuthoritative", ap_set_flag_slot, 
@@ -916,28 +1235,60 @@ static const command_rec authnz_ds_cmds[] =
                   (void *)APR_OFFSETOF(authn_ds_config_t, kerberos_keytab), OR_AUTHCFG, 
                   "Specify the location of the Kerberos V5 keytab file"), 
     
-    AP_INIT_TAKE1("AuthnDSRealms", save_kerberos_realms, 
-                  (void *)APR_OFFSETOF(authn_ds_config_t, kerberos_realms), OR_AUTHCFG, 
-                  "Specify the realms that Kerberos can authenticate against"), 
-    
-    AP_INIT_TAKE1("AuthnDSRealm", save_kerberos_realms, 
-                  (void *)APR_OFFSETOF(authn_ds_config_t, kerberos_realms), OR_AUTHCFG, 
-                  "Alias for AuthnDSRealms"), 
-    
     AP_INIT_TAKE1("AuthnDSServiceName", ap_set_string_slot, 
                   (void *)APR_OFFSETOF(authn_ds_config_t, kerberos_service_name), OR_AUTHCFG, 
                   "The Kerberos service name"), 
     
+    AP_INIT_TAKE1("AuthnDSCacheTTL", ap_set_int_slot, 
+                  (void *)APR_OFFSETOF(authn_ds_config_t, cache_ttl), OR_AUTHCFG, 
+                  "The password cache Time-To-Live"), 
+    
     { NULL }
 };
 
+
 // -------------------------------------------------------------------------------------------------
+
+/**
+ * Function: authnz_ds_post_config
+ *
+ * Sets up post-configuration options.
+ *
+ * This is called automatically through the post_config hook.
+ *
+ * Currently not used.
+ *
+ * Parameters:
+ *   apr_pool_t *p      - a pointer to the main allocation pool for the module
+ *   apr_pool_t *plog   - a pointer to the log allocation pool
+ *   apr_pool_t *ptemp  - a pointer to an allocation pool for temporary objects
+ *   server_rec *s      - a pointer to the server_req object
+ *
+ * Returns:
+ *   OK
+ */
 static int authnz_ds_post_config(apr_pool_t *p, apr_pool_t *plog, apr_pool_t *ptemp, server_rec *s)
 {
     return OK;
 }
 
 // -------------------------------------------------------------------------------------------------
+
+/**
+ * Function: register_hooks
+ *
+ * Sets up the hooks for this module in the Apache request handling process.
+ *
+ * Currently, it utilizes the following hooks:
+ *
+ *   post_config    - calls <authnz_ds_post_config> to set up post-configuration details
+ *   child_init     - calls <authnz_ds_child_init> to create the cache for each server thread
+ *   check_user_id  - calls <authn_ds_authenticate> to process the user's authentication
+ *   auth_checker   - calls <authz_ds_authorize> to process the user's authorization
+ *
+ * It also sets that this authorization scheme should take place BEFORE mod_authz_user so that one 
+ * may specify a specific group or user, and or simply 'valid-user' if desired.
+ */
 static void register_hooks(apr_pool_t *p)
 {
     // Specify that the authorization here should take place BEFORE mod_authz_user
@@ -952,6 +1303,20 @@ static void register_hooks(apr_pool_t *p)
 // -------------------------------------------------------------------------------------------------
 // Apache 2.x module configuration
 // -------------------------------------------------------------------------------------------------
+
+/**
+ * Module: authnz_ds_module
+ *
+ * Creates the module object that tells Apache about this module.  Links the per-directory config 
+ * and server config as well as registering the hooks for this module and what configuration 
+ * commands it accepts.
+ *
+ * See Also:
+ *   <create_authnz_ds_dir_config>, 
+ *   <create_authnz_ds_server_state>, 
+ *   <authnz_ds_cmds>, 
+ *   <register_hooks>
+ */
 module AP_MODULE_DECLARE_DATA authnz_ds_module = 
 {
     STANDARD20_MODULE_STUFF, 
