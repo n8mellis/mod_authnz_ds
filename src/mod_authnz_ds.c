@@ -493,10 +493,16 @@ static int authn_ds_kerberos(request_rec *r, authn_ds_config_t *conf, const char
 //    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, 
 //                  "Input Token: %s", inputToken.value);
     
+    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "Context (before): %d", context);
+    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "Server Creds (before): %d", serverCreds);
+    
     majorStatus = gss_accept_sec_context(&minorStatus, &context, serverCreds, &inputToken, 
                                          GSS_C_NO_CHANNEL_BINDINGS, &clientName, NULL, 
                                          &outputToken, NULL, NULL, NULL);
     
+    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "Context (after): %d", context);
+    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "Server Creds (after): %d", serverCreds);
+
     ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "Verification returned major code %d", majorStatus);
     ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "Verification returned minor code %d", minorStatus);
     
@@ -576,11 +582,17 @@ end:
     if (clientName != GSS_C_NO_NAME)
         gss_release_name(&minorStatus, &clientName);
     
-    if (serverCreds != GSS_C_NO_CREDENTIAL)
-        gss_release_cred(&minorStatus, &serverCreds);
-    
-    if (context != GSS_C_NO_CONTEXT)
+    if (context != GSS_C_NO_CONTEXT) {
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "Deleting Sec Context");
         gss_delete_sec_context(&minorStatus, &context, GSS_C_NO_BUFFER);
+        context = GSS_C_NO_CONTEXT;
+    }
+    
+    if (serverCreds != GSS_C_NO_CREDENTIAL) {
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "Releasing GSS Credentials");
+        gss_release_cred(&minorStatus, &serverCreds);
+        serverCreds = GSS_C_NO_CREDENTIAL;
+    }
     
     return response;
 }
