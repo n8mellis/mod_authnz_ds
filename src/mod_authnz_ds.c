@@ -843,8 +843,11 @@ static int authn_ds_authenticate(request_rec *r)
     int response;
     static int last_response = HTTP_UNAUTHORIZED;
     
-    // Get the AuthType directive value specified in the config file
+    // Get the AuthType directive value specified in the config file and decline the 
+    // authorization if it was not meant for us.
     type = ap_auth_type(r);
+    if (!(type && strcasecmp(type, "DirectoryServices") == 0))
+        return DECLINED;
     
     // Get what the user sent in the HTTP header
     auth_line = apr_table_get(r->headers_in, (r->proxyreq == PROXYREQ_PROXY) ? 
