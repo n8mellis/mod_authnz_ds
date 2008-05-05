@@ -1,15 +1,8 @@
 APXS = @APXS@
 LIB_resolv = @LIB_resolv@
 
-CPPFLAGS = -I.
-LDFLAGS = $(LIB_resolv) -framework Security
-CFLAGS = 
-
-# APXS_CPPFLAGS = ${shell [ -n "${CPPFLAGS}" ] && echo ${CPPFLAGS} | sed -e 's/\([^ ]*\)/-Wc,\1/g'}
-# APXS_LDFLAGS	= ${shell [ -n "${LDFLAGS}"	 ] && echo ${LDFLAGS}	 | sed -e 's/\([^ ]*\)/-Wl,\1/g'}
-
-APXS_CPPFLAGS = -Wc,-I. -Wc,"-arch ppc -arch i386"
-APXS_LDFLAGS = -Wl,"-framework DirectoryService -framework Kerberos" -Wl,-lresolv -Wl,"-arch i386 -arch ppc"
+APXS_CPPFLAGS = -Wc,-I. -Wc,"-arch i386" -Wc,"-arch x86_64" -Wc,"-arch ppc" -Wc,"-arch ppc64"
+APXS_LDFLAGS  = -Wl,"-framework DirectoryService -framework Kerberos" -Wl,-lresolv -Wl,"-arch i386" -Wl,"-arch x86_64" -Wl,"-arch ppc" -Wl,"-arch ppc64"
 
 # echo $(APXS_CPPFLAGS)
 
