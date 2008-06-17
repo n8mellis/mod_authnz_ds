@@ -1284,6 +1284,7 @@ static const command_rec authnz_ds_cmds[] =
  */
 static int authnz_ds_post_config(apr_pool_t *p, apr_pool_t *plog, apr_pool_t *ptemp, server_rec *s)
 {
+    putenv(strdup("KRB5RCACHETYPE=none"));
     return OK;
 }
 
